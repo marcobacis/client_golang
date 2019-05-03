@@ -26,16 +26,33 @@ type goCollector struct {
 	gcDesc         *Desc
 	goInfoDesc     *Desc
 
-	// metrics to describe and collect
-	metrics memStatsMetrics
+	// msMetrics to describe and collect
+	msMetrics memStatsMetrics
 }
 
 // NewGoCollector returns a collector which exports metrics about the current Go
 // process. This includes memory stats. To collect those, runtime.ReadMemStats
-// is called. This causes a stop-the-world, which is very short with Go1.9+
-// (~25µs). However, with older Go versions, the stop-the-world duration depends
-// on the heap size and can be quite significant (~1.7 ms/GiB as per
+// is called. This requires to “stop the world”, which usually only happens for
+// garbage collection (GC). Take the following implications into account when
+// deciding whether to use the Go collector:
+//
+// 1. The performance impact of stopping the world is the more relevant the more
+// frequently metrics are collected. However, with Go1.9 or later the
+// stop-the-world time per metrics collection is very short (~25µs) so that the
+// performance impact will only matter in rare cases. However, with older Go
+// versions, the stop-the-world duration depends on the heap size and can be
+// quite significant (~1.7 ms/GiB as per
 // https://go-review.googlesource.com/c/go/+/34937).
+//
+// 2. During an ongoing GC, nothing else can stop the world. Therefore, if the
+// metrics collection happens to coincide with GC, it will only complete after
+// GC has finished. Usually, GC is fast enough to not cause problems. However,
+// with a very large heap, GC might take multiple seconds, which is enough to
+// cause scrape timeouts in common setups. To avoid this problem, the Go
+// collector will omit the memstat metrics if runtime.ReadMemStats takes more
+// than 1s. This will create gaps in the related time series. (The problem might
+// be solved in Go1.13, see https://github.com/golang/go/issues/19812 for the
+// related Go issue.)
 func NewGoCollector() Collector {
 	return &goCollector{
 		goroutinesDesc: NewDesc(
@@ -54,7 +71,7 @@ func NewGoCollector() Collector {
 			"go_info",
 			"Information about the Go environment.",
 			nil, Labels{"version": runtime.Version()}),
-		metrics: memStatsMetrics{
+		msMetrics: memStatsMetrics{
 			{
 				desc: NewDesc(
 					memstatNamespace("alloc_bytes"),
@@ -262,13 +279,22 @@ func (c *goCollector) Describe(ch chan<- *Desc) {
 	ch <- c.threadsDesc
 	ch <- c.gcDesc
 	ch <- c.goInfoDesc
-	for _, i := range c.metrics {
+	for _, i := range c.msMetrics {
 		ch <- i.desc
 	}
 }
 
 // Collect returns the current state of all metrics of the collector.
 func (c *goCollector) Collect(ch chan<- Metric) {
+	ms := &runtime.MemStats{}
+	msDone := make(chan struct{})
+	timer := time.NewTimer(time.Second)
+	// Start ReadMemStats first as it might take a while.
+	go func() {
+		runtime.ReadMemStats(ms)
+		close(msDone)
+	}()
+
 	ch <- MustNewConstMetric(c.goroutinesDesc, GaugeValue, float64(runtime.NumGoroutine()))
 	n, _ := runtime.ThreadCreateProfile(nil)
 	ch <- MustNewConstMetric(c.threadsDesc, GaugeValue, float64(n))
@@ -286,10 +312,14 @@ func (c *goCollector) Collect(ch chan<- Metric) {
 
 	ch <- MustNewConstMetric(c.goInfoDesc, GaugeValue, 1)
 
-	ms := &runtime.MemStats{}
-	runtime.ReadMemStats(ms)
-	for _, i := range c.metrics {
-		ch <- MustNewConstMetric(i.desc, i.valType, i.eval(ms))
+	select {
+	case <-timer.C:
+		return // Skip memstats.
+	case <-msDone:
+		timer.Stop() // Release resources. Important for high collection frequencies.
+		for _, i := range c.msMetrics {
+			ch <- MustNewConstMetric(i.desc, i.valType, i.eval(ms))
+		}
 	}
 }
 
