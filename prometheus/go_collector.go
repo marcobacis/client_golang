@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
@@ -26,8 +27,10 @@ type goCollector struct {
 	gcDesc         *Desc
 	goInfoDesc     *Desc
 
-	// msMetrics to describe and collect
-	msMetrics memStatsMetrics
+	msLast          *runtime.MemStats
+	msLastTimestamp time.Time
+	msMtx           sync.Mutex // Protects msLast and msLastTimestamp.
+	msMetrics       memStatsMetrics
 }
 
 // NewGoCollector returns a collector which exports metrics about the current Go
@@ -71,6 +74,7 @@ func NewGoCollector() Collector {
 			"go_info",
 			"Information about the Go environment.",
 			nil, Labels{"version": runtime.Version()}),
+		msLast: &runtime.MemStats{},
 		msMetrics: memStatsMetrics{
 			{
 				desc: NewDesc(
@@ -286,13 +290,18 @@ func (c *goCollector) Describe(ch chan<- *Desc) {
 
 // Collect returns the current state of all metrics of the collector.
 func (c *goCollector) Collect(ch chan<- Metric) {
-	ms := &runtime.MemStats{}
-	msDone := make(chan struct{})
-	timer := time.NewTimer(time.Second)
-	// Start ReadMemStats first as it might take a while.
+	var (
+		ms   = &runtime.MemStats{}
+		done = make(chan struct{})
+	)
+	// Request ReadMemStats first as it might take a while.
 	go func() {
 		runtime.ReadMemStats(ms)
-		close(msDone)
+		c.msMtx.Lock()
+		c.msLast = ms
+		c.msLastTimestamp = time.Now()
+		c.msMtx.Unlock()
+		close(done)
 	}()
 
 	ch <- MustNewConstMetric(c.goroutinesDesc, GaugeValue, float64(runtime.NumGoroutine()))
@@ -312,14 +321,32 @@ func (c *goCollector) Collect(ch chan<- Metric) {
 
 	ch <- MustNewConstMetric(c.goInfoDesc, GaugeValue, 1)
 
+	timer := time.NewTimer(time.Second)
 	select {
-	case <-timer.C:
-		return // Skip memstats.
-	case <-msDone:
-		timer.Stop() // Release resources. Important for high collection frequencies.
-		for _, i := range c.msMetrics {
-			ch <- MustNewConstMetric(i.desc, i.valType, i.eval(ms))
-		}
+	case <-done: // Our own ReadMemStats succeeded in time. Use it.
+		timer.Stop() // Important for high collection frequencies to not pile up timers.
+		c.collectMemStats(ch, ms)
+		return
+	case <-timer.C: // Time out, use last memstats if possible. Continue below.
+	}
+	c.msMtx.Lock()
+	if time.Since(c.msLastTimestamp) < 5*time.Minute {
+		// Last memstats are recent enough. Collect from them under the lock.
+		c.collectMemStats(ch, c.msLast)
+		c.msMtx.Unlock()
+		return
+	}
+	// If we are here, the last memstats are too old or don't exist. We have
+	// to wait until our own ReadMemStats finally completes. For that to
+	// happen, we have to release the lock.
+	c.msMtx.Unlock()
+	<-done
+	c.collectMemStats(ch, ms)
+}
+
+func (c *goCollector) collectMemStats(ch chan<- Metric, ms *runtime.MemStats) {
+	for _, i := range c.msMetrics {
+		ch <- MustNewConstMetric(i.desc, i.valType, i.eval(ms))
 	}
 }
 
