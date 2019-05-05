@@ -27,10 +27,14 @@ type goCollector struct {
 	gcDesc         *Desc
 	goInfoDesc     *Desc
 
-	msLast          *runtime.MemStats
+	// ms... are memstats related.
+	msLast          *runtime.MemStats // Previously collected memstats.
 	msLastTimestamp time.Time
 	msMtx           sync.Mutex // Protects msLast and msLastTimestamp.
 	msMetrics       memStatsMetrics
+	msRead          func(*runtime.MemStats) // For mocking in tests.
+	msMaxWait       time.Duration           // Wait time for fresh memstats.
+	msMaxAge        time.Duration           // Maximum allowed age of old memstats.
 }
 
 // NewGoCollector returns a collector which exports metrics about the current Go
@@ -52,10 +56,12 @@ type goCollector struct {
 // GC has finished. Usually, GC is fast enough to not cause problems. However,
 // with a very large heap, GC might take multiple seconds, which is enough to
 // cause scrape timeouts in common setups. To avoid this problem, the Go
-// collector will omit the memstat metrics if runtime.ReadMemStats takes more
-// than 1s. This will create gaps in the related time series. (The problem might
-// be solved in Go1.13, see https://github.com/golang/go/issues/19812 for the
-// related Go issue.)
+// collector will use the memstats from a previous collection if
+// runtime.ReadMemStats takes more than 1s. However, if there are no previously
+// collected memstats, or their collection is more than 5m ago, the collection
+// will block until runtime.ReadMemStats succeeds. (The problem might be solved
+// in Go1.13, see https://github.com/golang/go/issues/19812 for the related Go
+// issue.)
 func NewGoCollector() Collector {
 	return &goCollector{
 		goroutinesDesc: NewDesc(
@@ -74,7 +80,10 @@ func NewGoCollector() Collector {
 			"go_info",
 			"Information about the Go environment.",
 			nil, Labels{"version": runtime.Version()}),
-		msLast: &runtime.MemStats{},
+		msLast:    &runtime.MemStats{},
+		msRead:    runtime.ReadMemStats,
+		msMaxWait: time.Second,
+		msMaxAge:  5 * time.Minute,
 		msMetrics: memStatsMetrics{
 			{
 				desc: NewDesc(
@@ -294,9 +303,9 @@ func (c *goCollector) Collect(ch chan<- Metric) {
 		ms   = &runtime.MemStats{}
 		done = make(chan struct{})
 	)
-	// Request ReadMemStats first as it might take a while.
+	// Start reading memstats first as it might take a while.
 	go func() {
-		runtime.ReadMemStats(ms)
+		c.msRead(ms)
 		c.msMtx.Lock()
 		c.msLast = ms
 		c.msLastTimestamp = time.Now()
@@ -321,18 +330,18 @@ func (c *goCollector) Collect(ch chan<- Metric) {
 
 	ch <- MustNewConstMetric(c.goInfoDesc, GaugeValue, 1)
 
-	timer := time.NewTimer(time.Second)
+	timer := time.NewTimer(c.msMaxWait)
 	select {
 	case <-done: // Our own ReadMemStats succeeded in time. Use it.
 		timer.Stop() // Important for high collection frequencies to not pile up timers.
-		c.collectMemStats(ch, ms)
+		c.msCollect(ch, ms)
 		return
 	case <-timer.C: // Time out, use last memstats if possible. Continue below.
 	}
 	c.msMtx.Lock()
-	if time.Since(c.msLastTimestamp) < 5*time.Minute {
+	if time.Since(c.msLastTimestamp) < c.msMaxAge {
 		// Last memstats are recent enough. Collect from them under the lock.
-		c.collectMemStats(ch, c.msLast)
+		c.msCollect(ch, c.msLast)
 		c.msMtx.Unlock()
 		return
 	}
@@ -341,10 +350,10 @@ func (c *goCollector) Collect(ch chan<- Metric) {
 	// happen, we have to release the lock.
 	c.msMtx.Unlock()
 	<-done
-	c.collectMemStats(ch, ms)
+	c.msCollect(ch, ms)
 }
 
-func (c *goCollector) collectMemStats(ch chan<- Metric, ms *runtime.MemStats) {
+func (c *goCollector) msCollect(ch chan<- Metric, ms *runtime.MemStats) {
 	for _, i := range c.msMetrics {
 		ch <- MustNewConstMetric(i.desc, i.valType, i.eval(ms))
 	}
