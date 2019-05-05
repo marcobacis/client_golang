@@ -14,7 +14,6 @@
 package prometheus
 
 import (
-	"fmt"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -283,7 +282,7 @@ func NewGoCollector() Collector {
 }
 
 func memstatNamespace(s string) string {
-	return fmt.Sprintf("go_memstats_%s", s)
+	return "go_memstats_" + s
 }
 
 // Describe returns all descriptions of the collector.
